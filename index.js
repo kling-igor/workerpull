@@ -33,18 +33,15 @@ class Worker extends EventEmitter {
   }
 }
 
+const MAX_WORKERS = 5
 const WORKERS = 3
 
 class LinterQueue {
-  // worker = new Worker()
-
-  workerPull = []
-
-  idleWorkersIds = []
-
-  queue = []
+  busyWorkers = []
+  idleWorkers = []
 
   runningTasks = []
+  pendingTasks = []
 
   newWorkerUUID = 0
 
@@ -54,19 +51,23 @@ class LinterQueue {
       const workerId = this.newWorkerUUID
       const worker = new Worker(workerId)
       worker.on('message', this.handleWorkerResponse)
-      this.workerPull.push(worker)
-      this.idleWorkersIds.push(workerId)
+      this.idleWorkers.push(worker)
+
+      // this.idleWorkersIds.push(workerId)
       this.newWorkerUUID += 1
     }
   }
 
   dispose() {
     // this.worker.removeAllListeners('message')
-    this.queue.forEach(({ abort }) => abort())
-    this.queue = []
+    this.pendingTasks.forEach(({ abort }) => abort())
+    this.pendingTasks = []
+
+    this.runningTasks = []
   }
 
   loadWorker(marker, fileName, buffer, version) {
+    console.log('loading worker with file:', fileName)
     // // если пулл ворекров не заполнен и нет свободных воркеров, то нужно создать еще
     // if (this.workerPull.length < WATERMARK && this.idleWorkersIds.length === 0) {
     //   const workerId = this.workerPull.length
@@ -77,22 +78,18 @@ class LinterQueue {
     //   this.idleWorkersIds = [...this.idleWorkersIds, workerId]
     // }
 
-    if (this.idleWorkersIds.length === 0) {
+    if (this.idleWorkers.length === 0) {
       console.error('NO FREE WORKERS!!!!')
       const workerId = this.newWorkerUUID
       const worker = new Worker(workerId)
       this.newWorkerUUID += 1
       worker.on('message', this.handleWorkerResponse)
-      this.workerPull.push(worker)
-      this.idleWorkersIds = [...this.idleWorkersIds, workerId]
-    } else {
-      const idleWorkerId = this.idleWorkersIds.shift()
-      // на всякий случай удаляем возможные дубликаты
-      this.idleWorkersIds = this.idleWorkersIds.filter(i => i !== idleWorkerId)
-
-      console.log(`loading worker ${idleWorkerId} on task ${fileName}, freeWorkers: ${this.idleWorkersIds}`)
-      this.workerPull[idleWorkerId].post(marker, fileName, buffer, version)
+      this.idleWorkers.push(worker)
     }
+
+    const idleWorker = this.idleWorkers.shift()
+    this.busyWorkers.push(idleWorker)
+    idleWorker.post(marker, fileName, buffer, version)
   }
 
   lint({ fileName, buffer, version }) {
@@ -107,11 +104,11 @@ class LinterQueue {
       }
 
       const task = () => {
-        timeoutHandler.timerId = setTimeout(abort, 2000)
+        timeoutHandler.timerId = setTimeout(abort, 3000)
         this.loadWorker(marker, fileName, buffer, version)
       }
 
-      this.queue.push({
+      this.pendingTasks.push({
         fileName, // remove!!! FOR DEBUG ONLY
         marker,
         task,
@@ -122,50 +119,69 @@ class LinterQueue {
         abort
       })
 
-      const tasks = this.queue.map(({ fileName }) => fileName).join(' | ')
+      // const tasks = this.pendingTasks.map(({ fileName }) => fileName).join(' | ')
       // console.log('PUT NEW TASK:', tasks)
 
       // если задач ровно 1 в очереди или есть свободные воркеры, то выполнить ее
       // if (/*this.idleWorkersIds.length > 0 && */ this.queue.length === 1) {
-      const current = this.queue.shift()
-      this.runningTasks.push(current)
-      current.task()
+
+      // if (this.idleWorkers.length > 0 || this.busyWorkers.length < MAX_WORKERS) {
+      if (this.idleWorkers.length > 0) {
+        const current = this.pendingTasks.shift()
+        this.runningTasks.push(current)
+        current.task()
+      }
+      // }
+
       // }
     })
   }
 
   handleWorkerResponse = (workerId, marker, fileName, version, markers, output) => {
-    const index = this.runningTasks.findIndex(task => task.marker === marker)
-    if (index !== -1) {
-      const [task] = this.runningTasks.splice(index, 1)
-      task.resolve({ fileName, version, markers, output })
+    console.log('handleWorkerResponse:', workerId)
+    const taskIndex = this.runningTasks.findIndex(task => task.marker === marker)
+    if (taskIndex === -1) {
+      console.log('TASK NOT FOUND')
 
-      // говорим что этот воркер свободен
-      this.idleWorkersIds.push(workerId)
-      // console.log('free workers:', this.idleWorkersIds)
+      return
+    }
 
-      const pendingTaskCount = this.queue.length
+    const [task] = this.runningTasks.splice(taskIndex, 1)
+    task.resolve({ fileName, version, markers, output })
 
-      // console.log('pending tasks:', pendingTaskCount)
+    const workerIndex = this.busyWorkers.findIndex(worker => worker.id === workerId)
+    if (workerIndex !== -1) {
+      const [worker] = this.busyWorkers.splice(workerIndex, 1)
+      this.idleWorkers.push(worker)
 
-      if (pendingTaskCount > 0) {
-        // запускаем наиболее старую задачу (скорее все на освободившемся воркере)
-        const current = this.queue.shift()
-        this.runningTasks.push(current)
-        current.task()
-      } else {
-        // пытаемся урезать пулл воркеров
-        // TODO: работа с воркерами в предположении что идентификатор воркера совпадает с его положением в пулле, что в случае удаления НЕ ВЕРНО!!!
-        // СКОРРЕКТИРОВАТЬ ЭТОТ ВОПРОС
-        // const length = Math.floor(this.idleWorkersIds.length / 2)
-        // if (length) {
-        //   const removingWorkersIds = this.idleWorkersIds.splice(0, length)
+      console.log(`BUSY: ${this.busyWorkers.length}, IDLE: ${this.idleWorkers.length}`)
+    } else {
+      console.log('worker not found:', workerId)
+    }
+
+    // console.log('free workers:', this.idleWorkersIds)
+
+    const pendingTaskCount = this.pendingTasks.length
+
+    // console.log('pending tasks:', pendingTaskCount)
+
+    console.log(`has ${pendingTaskCount} pending tasks`)
+    if (pendingTaskCount > 0) {
+      // запускаем наиболее старую задачу (скорее все на освободившемся воркере)
+      const current = this.pendingTasks.shift()
+      this.runningTasks.push(current)
+      current.task()
+    } else {
+      // пытаемся урезать пулл воркеров
+      const length = Math.floor(this.idleWorkers.length / 2)
+      if (length) {
+        const removingWorkers = this.idleWorkers.splice(0, length)
         //   console.log('REMOVING WORKERS:', removingWorkersIds)
-        //   for (const i of removingWorkersIds) {
-        //     // const [worker] = this.workerPull.splice(i, 1)
-        //     worker.dispose()
-        //   }
-        // }
+        for (const worker of removingWorkers) {
+          worker.dispose()
+        }
+
+        console.log('remain idle workers:', this.idleWorkers.length)
       }
     }
   }
@@ -194,7 +210,7 @@ const launchTask = () => {
         // применяем output (если есть)
       })
       .catch(({ fileName }) => {
-        // console.log('timeout for lint file ', fileName)
+        console.log('timeout for lint file ', fileName)
       })
 
     counter += 1
