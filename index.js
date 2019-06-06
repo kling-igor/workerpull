@@ -35,6 +35,7 @@ class LinterQueue {
 
   dispose() {
     this.worker.removeListener('message', this.handleWorkerResponse)
+    this.queue.forEach(({ abort }) => abort())
     this.queue = []
   }
 
@@ -44,13 +45,14 @@ class LinterQueue {
 
       const timeoutHandler = {}
 
+      const abort = () => {
+        clearTimeout(timeoutHandler.timerId)
+        reject({ fileName })
+      }
+
       const task = () => {
         console.log('running task for ', fileName)
-        timeoutHandler.timerId = setTimeout(() => {
-          console.log('rejecting by timeout')
-          reject({ fileName })
-        }, 2000)
-
+        timeoutHandler.timerId = setTimeout(abort, 2000)
         this.worker.post(marker, fileName, buffer, version)
       }
 
@@ -61,7 +63,8 @@ class LinterQueue {
         resolve: (...args) => {
           clearTimeout(timeoutHandler.timerId)
           resolve(...args)
-        }
+        },
+        abort
       })
 
       const tasks = this.queue.map(({ fileName }) => fileName).join(' | ')
@@ -114,7 +117,7 @@ const launchTask = () => {
         // применяем output (если есть)
       })
       .catch(({ fileName }) => {
-        console.log('timeout for lint file ', fileName)
+        // console.log('timeout for lint file ', fileName)
       })
 
     counter += 1
